@@ -153,8 +153,9 @@ Notes on the details that matter:
   critical, as long as the network itself predicts x.
 - **`noise_scale` defaults to `image_size / 256`**, holding SNR roughly fixed
   across resolutions (2x at 512, 4x at 1024).
-- **`t` is rescaled by 1000** before the sinusoidal timestep embedding, which
-  was designed for integer timesteps.
+- **The timestep embedder takes `t` in `[0,1]` directly.** Its frequency ladder
+  is defined over the unit interval (`max_freq` down to `max_freq/bandwidth`),
+  so no caller has to rescale time on the way in.
 - **The final ODE step always uses Euler**, even under `--solver heun`: at
   `t=1` the corrector would divide by the clipped denominator and inflate the
   velocity by up to 20x.

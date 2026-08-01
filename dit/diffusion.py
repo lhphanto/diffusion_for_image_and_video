@@ -59,20 +59,12 @@ class FlowMatching:
             shifts mass towards small ``t``, i.e. towards higher noise.
         denom_clip: lower bound on ``1 - t`` when dividing, which keeps the
             v-space conversion finite as ``t -> 1``.
-        time_scale: factor applied to ``t`` before it reaches the network's
-            sinusoidal timestep embedding. That embedding was designed for
-            integer timesteps in [0, 1000), so continuous ``t`` in [0, 1] is
-            rescaled to the same range.
+
+    The model is called with ``t`` in [0, 1] unchanged; its timestep embedder
+    owns the frequency band appropriate to that range.
     """
 
-    def __init__(
-        self,
-        noise_scale=1.0,
-        t_mu=-0.8,
-        t_sigma=0.8,
-        denom_clip=0.05,
-        time_scale=1000.0,
-    ):
+    def __init__(self, noise_scale=1.0, t_mu=-0.8, t_sigma=0.8, denom_clip=0.05):
         if noise_scale <= 0:
             raise ValueError(f"noise_scale must be positive, got {noise_scale}")
         if not 0 < denom_clip <= 1:
@@ -81,7 +73,6 @@ class FlowMatching:
         self.t_mu = t_mu
         self.t_sigma = t_sigma
         self.denom_clip = denom_clip
-        self.time_scale = time_scale
 
     def sample_t(self, batch_size, device=None, dtype=torch.float32, generator=None):
         """Sample ``t`` from the logit-normal distribution over [0, 1].
@@ -177,8 +168,7 @@ class FlowMatching:
         z_t = self.q_sample(x_start, t, noise=noise)
         v_target = self.to_velocity(x_start, z_t, t)
 
-        x_pred = model(z_t, self.time_scale * _broadcast_t(t, x_start).flatten(),
-                       **model_kwargs)
+        x_pred = model(z_t, _broadcast_t(t, x_start).flatten(), **model_kwargs)
         if x_pred.shape != x_start.shape:
             raise ValueError(
                 f"model returned {tuple(x_pred.shape)} but x-prediction expects "
@@ -197,11 +187,9 @@ class FlowMatching:
     def predict_x(self, model, z, t, y=None, cfg_scale=None):
         """Run the network at time ``t`` and return its x-prediction.
 
-        ``t`` may be a scalar; it is expanded to the batch and rescaled by
-        ``time_scale`` before reaching the model.
+        ``t`` may be a scalar; it is expanded to the batch.
         """
-        t_batch = _broadcast_t(t, z).flatten()
-        t_in = self.time_scale * t_batch
+        t_in = _broadcast_t(t, z).flatten()
         if cfg_scale is not None and cfg_scale != 1.0:
             if y is None:
                 raise ValueError("classifier-free guidance requires labels")

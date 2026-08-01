@@ -94,11 +94,33 @@ class PatchEmbed(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
-    """Sinusoidal timestep embedding followed by an MLP."""
+    """Sinusoidal embedding of a continuous time in [0, 1], then an MLP.
 
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    ``t`` is the flow-matching time: 0 is noise, 1 is data. The frequency
+    ladder is defined directly over the unit interval, in radians traversed
+    across it, from ``max_freq`` down to ``max_freq / bandwidth``. With the
+    defaults the fastest channel sweeps 1000 radians (~159 full cycles) as
+    ``t`` goes 0 -> 1, and the slowest about 0.1 radians.
+
+    Spanning several orders of magnitude is the point of the basis: fast
+    channels resolve nearby times, slow channels encode coarse position, and
+    only the ensemble is unambiguous (any single fast channel wraps many
+    times). A ladder confined to well under one radian would put every
+    argument in the region where ``sin(x) ~ x`` and ``cos(x) ~ 1``, collapsing
+    the whole embedding onto a couple of near-collinear directions.
+    """
+
+    def __init__(
+        self,
+        hidden_size,
+        frequency_embedding_size=256,
+        max_freq=1000.0,
+        bandwidth=10000.0,
+    ):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
+        self.max_freq = max_freq
+        self.bandwidth = bandwidth
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
@@ -106,10 +128,11 @@ class TimestepEmbedder(nn.Module):
         )
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def timestep_embedding(t, dim, max_freq=1000.0, bandwidth=10000.0):
+        """(N,) times in [0, 1] -> (N, dim) sin/cos features."""
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
+        freqs = max_freq * torch.exp(
+            -math.log(bandwidth)
             * torch.arange(half, dtype=torch.float32, device=t.device)
             / half
         )
@@ -120,7 +143,9 @@ class TimestepEmbedder(nn.Module):
         return emb
 
     def forward(self, t):
-        freqs = self.timestep_embedding(t, self.frequency_embedding_size)
+        freqs = self.timestep_embedding(
+            t, self.frequency_embedding_size, self.max_freq, self.bandwidth
+        )
         return self.mlp(freqs.to(self.mlp[0].weight.dtype))
 
 

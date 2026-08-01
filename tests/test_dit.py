@@ -90,6 +90,59 @@ def test_wrong_input_resolution_raises():
               torch.zeros(2, dtype=torch.long))
 
 
+def test_timestep_embedding_is_well_conditioned_on_the_unit_interval():
+    """The frequency band must span the unit interval, not collapse onto it.
+
+    If the ladder were confined to well under one cycle, every argument would
+    land where sin(x) ~ x and cos(x) ~ 1, and the whole basis would degenerate
+    onto a couple of near-collinear directions.
+    """
+    from dit.model import TimestepEmbedder
+
+    t = torch.linspace(0.001, 0.999, 256)
+    emb = TimestepEmbedder.timestep_embedding(t, 256)
+    centred = emb - emb.mean(0)
+    sv = torch.linalg.svdvals(centred.double())
+    effective_rank = int((sv > sv[0] * 1e-3).sum())
+    assert effective_rank > 50, effective_rank
+
+
+def test_timestep_embedding_separates_nearby_times():
+    from dit.model import TimestepEmbedder
+
+    t = torch.linspace(0.001, 0.999, 256)
+    emb = TimestepEmbedder.timestep_embedding(t, 256)
+    step = (emb[1:] - emb[:-1]).norm(dim=1)
+    assert step.min() > 0.1
+
+
+def test_timestep_embedding_frequency_band():
+    """Fastest channel ~max_freq cycles over [0,1], slowest ~max_freq/bandwidth."""
+    from dit.model import TimestepEmbedder
+
+    te = TimestepEmbedder(64, frequency_embedding_size=256)
+    assert te.max_freq == 1000.0 and te.bandwidth == 10000.0
+
+    # sin(freq * t) at t=1 for the fastest and slowest channels. The ladder
+    # runs over i = 0..half-1, so the slowest is bandwidth^(-(half-1)/half).
+    half = 128
+    lo = 1000.0 * 10000.0 ** (-(half - 1) / half)
+    emb = TimestepEmbedder.timestep_embedding(torch.tensor([1.0]), 256)
+    fastest, slowest = emb[0, 128], emb[0, 255]
+    assert torch.allclose(fastest, torch.sin(torch.tensor(1000.0)), atol=1e-3)
+    assert torch.allclose(slowest, torch.sin(torch.tensor(lo)), atol=1e-4)
+    assert 0.1 < lo < 0.11  # roughly a tenth of a radian across [0,1]
+
+
+def test_timestep_embedding_shape_and_finiteness():
+    from dit.model import TimestepEmbedder
+
+    te = TimestepEmbedder(64, frequency_embedding_size=256)
+    out = te(torch.rand(8))
+    assert out.shape == (8, 64)
+    assert torch.isfinite(out).all()
+
+
 def test_pos_embed_shape_and_determinism():
     pe = get_2d_sincos_pos_embed(64, 4)
     assert pe.shape == (16, 64)
@@ -513,9 +566,9 @@ def test_training_losses_rejects_a_learn_sigma_model():
         )
 
 
-def test_model_receives_rescaled_time():
-    """t in [0,1] must be scaled to the embedder's [0,1000) range."""
-    fm = FlowMatching(time_scale=1000.0)
+def test_model_receives_unscaled_time():
+    """The model is handed t in [0,1] directly; the embedder owns the band."""
+    fm = FlowMatching()
     seen = {}
 
     def spy(z, t, **kw):
@@ -524,7 +577,7 @@ def test_model_receives_rescaled_time():
 
     t = torch.tensor([0.0, 0.25, 1.0])
     fm.training_losses(spy, torch.randn(3, 3, 8, 8), t=t)
-    assert torch.allclose(seen["t"], torch.tensor([0.0, 250.0, 1000.0]), atol=1e-4)
+    assert torch.allclose(seen["t"], t, atol=1e-6)
     assert seen["t"].shape == (3,)
 
 
@@ -577,7 +630,7 @@ def quadrature_oracle(fm, u):
     """
 
     def oracle(z, t_in, y=None):
-        t = t_in / fm.time_scale  # undo the time rescaling
+        t = t_in  # the model receives t in [0,1] directly
         tb = t.view(-1, *([1] * (z.dim() - 1)))
         denom = (1 - tb).clamp(min=fm.denom_clip)
         return z + denom * u(tb)
@@ -636,7 +689,7 @@ def test_solver_evaluation_counts():
     calls = []
 
     def spy(z, t, y=None):
-        calls.append(float(t.flatten()[0]) / fm.time_scale)
+        calls.append(float(t.flatten()[0]))
         return torch.zeros_like(z)
 
     shape = (1, 1, 2, 2)
@@ -653,7 +706,7 @@ def test_time_grid_is_linear_from_zero_to_one():
     seen = []
 
     def spy(z, t, y=None):
-        seen.append(float(t.flatten()[0]) / fm.time_scale)
+        seen.append(float(t.flatten()[0]))
         return torch.zeros_like(z)
 
     fm.sample_loop(spy, (1, 1, 2, 2), torch.device("cpu"), num_steps=4,
@@ -667,7 +720,7 @@ def test_final_step_never_evaluates_at_t_equals_one():
     seen = []
 
     def spy(z, t, y=None):
-        seen.append(float(t.flatten()[0]) / fm.time_scale)
+        seen.append(float(t.flatten()[0]))
         return torch.zeros_like(z)
 
     fm.sample_loop(spy, (1, 1, 2, 2), torch.device("cpu"), num_steps=8,
