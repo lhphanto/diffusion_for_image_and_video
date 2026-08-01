@@ -757,6 +757,214 @@ def test_supplied_t_and_noise_make_the_loss_deterministic():
     assert torch.allclose(a, b, atol=1e-7)
 
 
+# -- flow matching: ODE samplers -----------------------------------------
+
+
+def quadrature_oracle(fm, u):
+    """Build a model whose velocity is exactly ``u(t)``, independent of z.
+
+    Then dz/dt = u(t), so integrating from 0 to 1 is pure quadrature with the
+    known answer ``z0 + integral(u)``. This isolates the solver's accuracy
+    from any property of the network.
+    """
+
+    def oracle(z, t_in, y=None):
+        t = t_in / fm.time_scale  # undo the time rescaling
+        tb = t.view(-1, *([1] * (z.dim() - 1)))
+        denom = (1 - tb).clamp(min=fm.denom_clip)
+        return z + denom * u(tb)
+
+    return oracle
+
+
+def test_sampler_recovers_a_constant_target():
+    """With a perfect denoiser the path is straight, so both solvers are exact."""
+    fm = FlowMatching()
+    target = torch.randn(2, 3, 8, 8)
+    z0 = torch.randn_like(target)
+    oracle = lambda z, t, y=None: target
+    for solver in ("euler", "heun"):
+        out = fm.sample_loop(oracle, target.shape, torch.device("cpu"),
+                             num_steps=10, solver=solver, noise=z0)
+        assert torch.allclose(out, target, atol=1e-4), solver
+
+
+def test_heun_is_more_accurate_than_euler():
+    fm = FlowMatching()
+    z0 = torch.zeros(1, 1, 1, 1)
+    u = torch.exp  # integral over [0,1] is e - 1
+    exact = math.e - 1.0
+    oracle = quadrature_oracle(fm, u)
+
+    def err(solver, n):
+        out = fm.sample_loop(oracle, z0.shape, torch.device("cpu"),
+                             num_steps=n, solver=solver, noise=z0)
+        return abs(out.item() - exact)
+
+    assert err("heun", 10) < err("euler", 10) / 3
+
+
+def test_heun_is_second_order_and_euler_is_first_order():
+    """Doubling the steps should quarter Heun's error but only halve Euler's."""
+    fm = FlowMatching()
+    z0 = torch.zeros(1, 1, 1, 1)
+    exact = math.e - 1.0
+    oracle = quadrature_oracle(fm, torch.exp)
+
+    def err(solver, n):
+        out = fm.sample_loop(oracle, z0.shape, torch.device("cpu"),
+                             num_steps=n, solver=solver, noise=z0)
+        return abs(out.item() - exact)
+
+    heun_ratio = err("heun", 40) / err("heun", 20)
+    euler_ratio = err("euler", 40) / err("euler", 20)
+    assert heun_ratio < 0.35, heun_ratio  # ~0.25
+    assert 0.4 < euler_ratio < 0.6, euler_ratio  # ~0.5
+
+
+def test_solver_evaluation_counts():
+    """Heun costs 2N-1 evaluations: two per step, minus the Euler final step."""
+    fm = FlowMatching()
+    calls = []
+
+    def spy(z, t, y=None):
+        calls.append(float(t.flatten()[0]) / fm.time_scale)
+        return torch.zeros_like(z)
+
+    shape = (1, 1, 2, 2)
+    fm.sample_loop(spy, shape, torch.device("cpu"), num_steps=5, solver="euler")
+    assert len(calls) == 5
+
+    calls.clear()
+    fm.sample_loop(spy, shape, torch.device("cpu"), num_steps=5, solver="heun")
+    assert len(calls) == 2 * 5 - 1
+
+
+def test_time_grid_is_linear_from_zero_to_one():
+    fm = FlowMatching()
+    seen = []
+
+    def spy(z, t, y=None):
+        seen.append(float(t.flatten()[0]) / fm.time_scale)
+        return torch.zeros_like(z)
+
+    fm.sample_loop(spy, (1, 1, 2, 2), torch.device("cpu"), num_steps=4,
+                   solver="euler")
+    assert seen == pytest.approx([0.0, 0.25, 0.5, 0.75])
+
+
+def test_final_step_never_evaluates_at_t_equals_one():
+    """t=1 would divide by the clipped denominator and inflate the velocity."""
+    fm = FlowMatching()
+    seen = []
+
+    def spy(z, t, y=None):
+        seen.append(float(t.flatten()[0]) / fm.time_scale)
+        return torch.zeros_like(z)
+
+    fm.sample_loop(spy, (1, 1, 2, 2), torch.device("cpu"), num_steps=8,
+                   solver="heun")
+    assert max(seen) < 1.0
+
+
+def test_sampler_runs_with_a_real_model():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    y = torch.randint(0, 10, (2,))
+    out = fm.sample_loop(model, (2, 3, 32, 32), torch.device("cpu"), y=y,
+                         num_steps=4, solver="heun")
+    assert out.shape == (2, 3, 32, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_sampler_runs_with_cfg():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    out = fm.sample_loop(model, (2, 3, 32, 32), torch.device("cpu"),
+                         y=torch.randint(0, 10, (2,)), cfg_scale=4.0,
+                         num_steps=3, solver="heun")
+    assert out.shape == (2, 3, 32, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_sampler_is_deterministic_given_the_initial_noise():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    z0 = torch.randn(2, 3, 32, 32)
+    kw = dict(y=torch.zeros(2, dtype=torch.long), num_steps=4, noise=z0)
+    a = fm.sample_loop(model, z0.shape, torch.device("cpu"), **kw)
+    b = fm.sample_loop(model, z0.shape, torch.device("cpu"), **kw)
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_initial_noise_uses_the_noise_scale():
+    fm = FlowMatching(noise_scale=3.0)
+    seen = {}
+
+    def spy(z, t, y=None):
+        seen.setdefault("z0_std", z.std().item())
+        return torch.zeros_like(z)
+
+    fm.sample_loop(spy, (4096, 1, 2, 2), torch.device("cpu"), num_steps=1)
+    assert abs(seen["z0_std"] - 3.0) < 0.1
+
+
+def test_cfg_interval_gates_guidance_by_time():
+    at = FlowMatching._guidance_at
+    assert at(4.0, (0.1, 1.0), 0.05) is None
+    assert at(4.0, (0.1, 1.0), 0.5) == 4.0
+    assert at(4.0, (0.1, 1.0), 1.0) == 4.0
+    # No interval means guidance everywhere; no scale means never.
+    assert at(4.0, None, 0.05) == 4.0
+    assert at(None, (0.1, 1.0), 0.5) is None
+
+
+def test_cfg_interval_changes_the_result():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    # Break the zero-init so the output actually depends on the label,
+    # otherwise the conditional and unconditional branches coincide and
+    # guidance is a no-op at any scale.
+    torch.nn.init.normal_(model.final_layer.linear.weight, std=0.05)
+    torch.nn.init.normal_(model.final_layer.adaLN_modulation[-1].weight, std=0.05)
+    z0 = torch.randn(2, 3, 32, 32)
+    kw = dict(y=torch.randint(0, 10, (2,)), cfg_scale=4.0, num_steps=6, noise=z0)
+    full = fm.sample_loop(model, z0.shape, torch.device("cpu"), **kw)
+    gated = fm.sample_loop(model, z0.shape, torch.device("cpu"),
+                           cfg_interval=(0.5, 1.0), **kw)
+    assert not torch.allclose(full, gated, atol=1e-5)
+
+
+def test_cfg_without_labels_is_an_error():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    with pytest.raises(ValueError, match="requires labels"):
+        fm.sample_loop(model, (2, 3, 32, 32), torch.device("cpu"),
+                       cfg_scale=2.0, num_steps=2)
+
+
+def test_sampler_validates_arguments():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    with pytest.raises(ValueError, match="unknown solver"):
+        fm.sample_loop(model, (1, 3, 32, 32), torch.device("cpu"), solver="rk4",
+                       y=torch.zeros(1, dtype=torch.long))
+    with pytest.raises(ValueError, match="num_steps"):
+        fm.sample_loop(model, (1, 3, 32, 32), torch.device("cpu"), num_steps=0,
+                       y=torch.zeros(1, dtype=torch.long))
+
+
+def test_single_step_sampling_returns_the_x_prediction():
+    """One Euler step from t=0 to t=1 is exactly the model's x-prediction."""
+    fm = FlowMatching()
+    target = torch.randn(2, 3, 8, 8)
+    z0 = torch.randn_like(target)
+    oracle = lambda z, t, y=None: target
+    out = fm.sample_loop(oracle, target.shape, torch.device("cpu"),
+                         num_steps=1, solver="heun", noise=z0)
+    assert torch.allclose(out, target, atol=1e-5)
+
+
 def test_reverse_process_recovers_data_with_an_oracle_model():
     """An oracle that knows the true noise should reconstruct x0 via DDIM."""
     torch.manual_seed(0)

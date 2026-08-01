@@ -207,6 +207,98 @@ class FlowMatching:
         terms["x_mse"] = (x_start - x_pred).pow(2).flatten(1).mean(1).detach()
         return terms
 
+    # -- sampling ----------------------------------------------------------
+
+    def predict_x(self, model, z, t, y=None, cfg_scale=None):
+        """Run the network at time ``t`` and return its x-prediction.
+
+        ``t`` may be a scalar; it is expanded to the batch and rescaled by
+        ``time_scale`` before reaching the model.
+        """
+        t_batch = _broadcast_t(t, z).flatten()
+        t_in = self.time_scale * t_batch
+        if cfg_scale is not None and cfg_scale != 1.0:
+            if y is None:
+                raise ValueError("classifier-free guidance requires labels")
+            # forward_with_cfg guides the first in_channels outputs, which for
+            # an x-prediction model is the whole prediction, and returns a
+            # doubled batch whose halves are identical.
+            return model.forward_with_cfg(z, t_in, y, cfg_scale)[: z.shape[0]]
+        return model(z, t_in, y) if y is not None else model(z, t_in)
+
+    def velocity(self, model, z, t, y=None, cfg_scale=None):
+        """The ODE right-hand side: the model's x-prediction, in v-space."""
+        x_pred = self.predict_x(model, z, t, y=y, cfg_scale=cfg_scale)
+        return self.to_velocity(x_pred, z, t)
+
+    @torch.no_grad()
+    def sample_loop(
+        self,
+        model,
+        shape,
+        device,
+        y=None,
+        cfg_scale=None,
+        num_steps=50,
+        solver="heun",
+        cfg_interval=None,
+        noise=None,
+        progress=False,
+    ):
+        """Integrate dz/dt = v(z, t) from t=0 (noise) to t=1 (data).
+
+        The time grid is linear in [0, 1], as in Tab. 9 of the paper.
+
+        Args:
+            solver: "heun" (2nd-order, 2 network evaluations per step) or
+                "euler" (1st-order, 1 evaluation per step). Heun costs
+                ``2 * num_steps - 1`` evaluations in total, since the final
+                step falls back to Euler.
+            cfg_interval: optional ``(lo, hi)`` restricting guidance to times
+                in that range; the paper uses ``(0.1, 1.0)``. Outside it the
+                unguided conditional prediction is used.
+        """
+        if solver not in ("heun", "euler"):
+            raise ValueError(f"unknown solver: {solver}")
+        if num_steps < 1:
+            raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+
+        z = self.sample_noise(torch.empty(shape, device=device)) if noise is None else noise
+        times = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=z.dtype)
+
+        steps = range(num_steps)
+        if progress:
+            steps = _tqdm(steps)
+
+        for i in steps:
+            t, t_next = times[i], times[i + 1]
+            h = t_next - t
+
+            scale = self._guidance_at(cfg_scale, cfg_interval, t)
+            v1 = self.velocity(model, z, t, y=y, cfg_scale=scale)
+            z_euler = z + h * v1
+
+            # The final step always uses Euler: at t=1 the corrector would
+            # divide by the clipped denominator, inflating the velocity by up
+            # to 1/denom_clip. This is the same endpoint handling as EDM.
+            if solver == "euler" or i == num_steps - 1:
+                z = z_euler
+                continue
+
+            scale_next = self._guidance_at(cfg_scale, cfg_interval, t_next)
+            v2 = self.velocity(model, z_euler, t_next, y=y, cfg_scale=scale_next)
+            z = z + 0.5 * h * (v1 + v2)
+
+        return z
+
+    @staticmethod
+    def _guidance_at(cfg_scale, cfg_interval, t):
+        """Guidance scale at time ``t``, or None outside the CFG interval."""
+        if cfg_scale is None or cfg_interval is None:
+            return cfg_scale
+        lo, hi = cfg_interval
+        return cfg_scale if lo <= float(t) <= hi else None
+
 
 def make_beta_schedule(name, num_timesteps):
     if name == "linear":
