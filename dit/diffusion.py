@@ -1,8 +1,14 @@
-"""Gaussian diffusion: schedules, training objective, and samplers.
+"""Forward/reverse processes: training objectives and samplers.
 
-Follows DDPM (Ho et al. 2020) with the improvements from Nichol & Dhariwal
-(2021) that DiT relies on: a cosine schedule and a learned reverse-process
-variance trained with the variational bound.
+Two paradigms live here:
+
+* :class:`FlowMatching` -- a linear interpolant with x-prediction, following
+  "Back to Basics: Let Denoising Generative Models Denoise"
+  (arXiv:2511.13720). This is the simpler formulation and the one being
+  migrated to.
+* :class:`GaussianDiffusion` -- discrete-time DDPM (Ho et al. 2020) with the
+  Nichol & Dhariwal (2021) improvements that the original DiT relies on:
+  a cosine schedule and a learned reverse-process variance.
 """
 
 import math
@@ -17,6 +23,189 @@ def _extract(arr, t, broadcast_shape):
     while res.dim() < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
+
+
+def _broadcast_t(t, x):
+    """Reshape a per-sample continuous time ``t`` to broadcast against ``x``.
+
+    ``t`` may be a scalar or a 1-D tensor of length ``x.shape[0]``.
+    """
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=x.device)
+    if t.dim() == 0:
+        t = t.expand(x.shape[0])
+    elif t.dim() != 1:
+        raise ValueError(f"t must be scalar or 1-D, got shape {tuple(t.shape)}")
+    if t.shape[0] != x.shape[0]:
+        raise ValueError(
+            f"t has batch size {t.shape[0]} but x has {x.shape[0]}"
+        )
+    t = t.to(device=x.device, dtype=x.dtype)
+    return t.view(-1, *([1] * (x.dim() - 1)))
+
+
+class FlowMatching:
+    """Linear-interpolant (flow matching / rectified flow) forward process.
+
+    Time runs from noise to data on a continuous interval ``t in [0, 1]``:
+
+        t = 0  ->  pure noise
+        t = 1  ->  clean data
+
+    which is the convention of arXiv:2511.13720 (Alg. 1). The forward process
+    is a straight line between the two endpoints::
+
+        z_t = t * x + (1 - t) * eps
+
+    Note this is the opposite direction from :class:`GaussianDiffusion`, where
+    ``t`` is a discrete index counting *up* from clean data to noise.
+
+    The network performs **x-prediction**: ``net(z_t, t)`` outputs an estimate
+    of the clean data directly, with no pre-conditioning. The loss is applied
+    in **v-space**, where ``v = (x - z_t) / (1 - t)``.
+
+    Args:
+        noise_scale: standard deviation of the noise endpoint. The paper keeps
+            the signal-to-noise ratio fixed across resolutions by scaling the
+            noise proportionally, i.e. ``noise_scale = image_size / 256``
+            (1.0 at 256x256, 2.0 at 512x512, 4.0 at 1024x1024).
+        t_mu, t_sigma: parameters of the logit-normal sampler for ``t``.
+            ``logit(t) ~ N(t_mu, t_sigma**2)``. A more negative ``t_mu``
+            shifts mass towards small ``t``, i.e. towards higher noise.
+        denom_clip: lower bound on ``1 - t`` when dividing, which keeps the
+            v-space conversion finite as ``t -> 1``.
+        time_scale: factor applied to ``t`` before it reaches the network's
+            sinusoidal timestep embedding. That embedding was designed for
+            integer timesteps in [0, 1000), so continuous ``t`` in [0, 1] is
+            rescaled to the same range.
+    """
+
+    def __init__(
+        self,
+        noise_scale=1.0,
+        t_mu=-0.8,
+        t_sigma=0.8,
+        denom_clip=0.05,
+        time_scale=1000.0,
+    ):
+        if noise_scale <= 0:
+            raise ValueError(f"noise_scale must be positive, got {noise_scale}")
+        if not 0 < denom_clip <= 1:
+            raise ValueError(f"denom_clip must be in (0, 1], got {denom_clip}")
+        self.noise_scale = noise_scale
+        self.t_mu = t_mu
+        self.t_sigma = t_sigma
+        self.denom_clip = denom_clip
+        self.time_scale = time_scale
+
+    def sample_t(self, batch_size, device=None, dtype=torch.float32, generator=None):
+        """Sample ``t`` from the logit-normal distribution over [0, 1].
+
+        ``logit(t) ~ N(t_mu, t_sigma**2)``, i.e. ``t = sigmoid(s)``. This
+        concentrates training on intermediate noise levels rather than the
+        uniform spacing used by discrete-time diffusion.
+        """
+        s = torch.empty(batch_size, device=device, dtype=dtype).normal_(
+            self.t_mu, self.t_sigma, generator=generator
+        )
+        return torch.sigmoid(s)
+
+    def sample_noise(self, x_start, generator=None):
+        """Draw the noise endpoint ``eps ~ N(0, noise_scale**2 I)``."""
+        noise = torch.empty_like(x_start).normal_(generator=generator)
+        if self.noise_scale != 1.0:
+            noise = noise * self.noise_scale
+        return noise
+
+    def q_sample(self, x_start, t, noise=None):
+        """Interpolate between data and noise: ``z_t = t * x + (1 - t) * eps``.
+
+        Args:
+            x_start: (N, C, H, W) clean data.
+            t: (N,) or scalar continuous time in [0, 1].
+            noise: optional (N, C, H, W) noise endpoint; drawn if omitted.
+        Returns:
+            (N, C, H, W) the network input ``z_t``.
+        """
+        if noise is None:
+            noise = self.sample_noise(x_start)
+        elif noise.shape != x_start.shape:
+            raise ValueError(
+                f"noise shape {tuple(noise.shape)} != "
+                f"x_start shape {tuple(x_start.shape)}"
+            )
+        t = _broadcast_t(t, x_start)
+        return t * x_start + (1.0 - t) * noise
+
+    # -- x <-> v conversion ------------------------------------------------
+
+    def _denom(self, t, x):
+        """``1 - t`` clipped away from zero, for use as a divisor."""
+        return (1.0 - _broadcast_t(t, x)).clamp(min=self.denom_clip)
+
+    def to_velocity(self, x, z_t, t):
+        """Convert an x-space quantity to v-space: ``v = (x - z_t) / (1 - t)``.
+
+        Applied to the ground-truth ``x`` this yields the target velocity;
+        applied to the network's prediction it yields the predicted velocity.
+        Without clipping this equals ``x - eps`` exactly, the constant
+        velocity of the straight path from noise to data.
+        """
+        return (x - z_t) / self._denom(t, z_t)
+
+    def from_velocity(self, v, z_t, t):
+        """Inverse of :meth:`to_velocity`: ``x = z_t + (1 - t) * v``."""
+        return z_t + self._denom(t, z_t) * v
+
+    # -- training ----------------------------------------------------------
+
+    def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
+        """x-prediction trained with an l2 loss in v-space (Alg. 1 of the paper).
+
+            z_t     = t * x + (1 - t) * eps
+            v       = (x - z_t) / (1 - t)
+            x_pred  = net(z_t, t)
+            v_pred  = (x_pred - z_t) / (1 - t)
+            loss    = || v - v_pred ||^2
+
+        Because both velocities share the same denominator, this is identical
+        to an x-space loss weighted by ``1 / (1 - t)^2`` -- the weighting the
+        paper finds preferable, though it reports the choice is not critical
+        so long as the *network* predicts x.
+
+        Args:
+            model: callable ``(z_t, t, **model_kwargs) -> x_pred``.
+            x_start: (N, C, H, W) clean data.
+            t: optional (N,) times in [0, 1]; sampled from the logit-normal
+                prior if omitted.
+            model_kwargs: extra arguments forwarded to the model, e.g. labels.
+            noise: optional noise endpoint; drawn if omitted.
+        """
+        model_kwargs = model_kwargs or {}
+        if noise is None:
+            noise = self.sample_noise(x_start)
+        if t is None:
+            t = self.sample_t(
+                x_start.shape[0], device=x_start.device, dtype=x_start.dtype
+            )
+
+        z_t = self.q_sample(x_start, t, noise=noise)
+        v_target = self.to_velocity(x_start, z_t, t)
+
+        x_pred = model(z_t, self.time_scale * _broadcast_t(t, x_start).flatten(),
+                       **model_kwargs)
+        if x_pred.shape != x_start.shape:
+            raise ValueError(
+                f"model returned {tuple(x_pred.shape)} but x-prediction expects "
+                f"{tuple(x_start.shape)}; build the model with learn_sigma=False"
+            )
+        v_pred = self.to_velocity(x_pred, z_t, t)
+
+        terms = {}
+        terms["loss"] = (v_target - v_pred).pow(2).flatten(1).mean(1)
+        # Reported for monitoring only; not optimised directly.
+        terms["x_mse"] = (x_start - x_pred).pow(2).flatten(1).mean(1).detach()
+        return terms
 
 
 def make_beta_schedule(name, num_timesteps):

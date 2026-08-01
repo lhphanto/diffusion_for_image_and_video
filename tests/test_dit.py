@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from dit.diffusion import GaussianDiffusion
+from dit.diffusion import FlowMatching, GaussianDiffusion
 from dit.model import DIT_MODELS, DiT, DiT_B, get_2d_sincos_pos_embed
 
 
@@ -461,6 +461,300 @@ def test_ddim_step_count_is_validated():
         d.ddim_sample_loop(tiny_model().eval(), (1, 3, 32, 32),
                            torch.device("cpu"), y=torch.zeros(1, dtype=torch.long),
                            num_steps=50)
+
+
+# -- flow matching: linear interpolant -----------------------------------
+
+
+def test_flow_q_sample_endpoints():
+    """t=1 is exactly the data, t=0 is exactly the noise."""
+    fm = FlowMatching()
+    x0 = torch.randn(4, 3, 8, 8)
+    eps = torch.randn_like(x0)
+    ones = torch.ones(4)
+    assert torch.allclose(fm.q_sample(x0, ones, noise=eps), x0, atol=1e-6)
+    assert torch.allclose(fm.q_sample(x0, ones * 0, noise=eps), eps, atol=1e-6)
+
+
+def test_flow_q_sample_is_the_linear_interpolant():
+    fm = FlowMatching()
+    x0 = torch.randn(4, 3, 8, 8)
+    eps = torch.randn_like(x0)
+    t = torch.rand(4)
+    tb = t.view(-1, 1, 1, 1)
+    expected = tb * x0 + (1 - tb) * eps
+    assert torch.allclose(fm.q_sample(x0, t, noise=eps), expected, atol=1e-6)
+
+
+def test_flow_q_sample_midpoint_is_the_average():
+    fm = FlowMatching()
+    x0 = torch.randn(2, 3, 8, 8)
+    eps = torch.randn_like(x0)
+    got = fm.q_sample(x0, torch.full((2,), 0.5), noise=eps)
+    assert torch.allclose(got, 0.5 * (x0 + eps), atol=1e-6)
+
+
+def test_flow_q_sample_applies_t_per_sample():
+    """Each element of the batch must get its own time."""
+    fm = FlowMatching()
+    x0 = torch.ones(3, 1, 2, 2)
+    eps = torch.zeros_like(x0)
+    z = fm.q_sample(x0, torch.tensor([0.0, 0.5, 1.0]), noise=eps)
+    assert torch.allclose(z[0], torch.zeros(1, 2, 2), atol=1e-6)
+    assert torch.allclose(z[1], torch.full((1, 2, 2), 0.5), atol=1e-6)
+    assert torch.allclose(z[2], torch.ones(1, 2, 2), atol=1e-6)
+
+
+def test_flow_q_sample_accepts_scalar_t():
+    fm = FlowMatching()
+    x0 = torch.randn(4, 3, 8, 8)
+    eps = torch.randn_like(x0)
+    a = fm.q_sample(x0, torch.tensor(0.3), noise=eps)
+    b = fm.q_sample(x0, 0.3, noise=eps)
+    c = fm.q_sample(x0, torch.full((4,), 0.3), noise=eps)
+    assert torch.allclose(a, c, atol=1e-6)
+    assert torch.allclose(b, c, atol=1e-6)
+
+
+def test_flow_q_sample_draws_noise_when_not_given():
+    fm = FlowMatching()
+    x0 = torch.zeros(4096, 1, 4, 4)
+    z = fm.q_sample(x0, torch.zeros(4096))  # t=0 -> z is exactly the noise
+    assert z.shape == x0.shape
+    assert abs(z.mean().item()) < 0.02
+    assert abs(z.std().item() - 1.0) < 0.02
+
+
+def test_flow_noise_scale_controls_the_noise_endpoint():
+    fm = FlowMatching(noise_scale=2.0)
+    x0 = torch.zeros(4096, 1, 4, 4)
+    z = fm.q_sample(x0, torch.zeros(4096))
+    assert abs(z.std().item() - 2.0) < 0.05
+
+
+def test_flow_noise_scale_does_not_touch_supplied_noise():
+    fm = FlowMatching(noise_scale=2.0)
+    x0 = torch.randn(2, 3, 4, 4)
+    eps = torch.randn_like(x0)
+    assert torch.allclose(fm.q_sample(x0, 0.0, noise=eps), eps, atol=1e-6)
+
+
+def test_flow_q_sample_variance_matches_closed_form():
+    """For independent x ~ N(0,1) and eps ~ N(0,1), Var(z_t) = t^2 + (1-t)^2."""
+    fm = FlowMatching()
+    x0 = torch.randn(20000, 1, 2, 2)
+    for t_val in (0.25, 0.5, 0.75):
+        z = fm.q_sample(x0, torch.full((20000,), t_val))
+        expected = math.sqrt(t_val**2 + (1 - t_val) ** 2)
+        assert abs(z.std().item() - expected) < 0.02, t_val
+
+
+def test_flow_velocity_is_constant_along_the_path():
+    """dz/dt = x - eps everywhere, which is what makes the path straight."""
+    fm = FlowMatching()
+    x0 = torch.randn(2, 3, 4, 4)
+    eps = torch.randn_like(x0)
+    z1 = fm.q_sample(x0, 0.2, noise=eps)
+    z2 = fm.q_sample(x0, 0.7, noise=eps)
+    assert torch.allclose((z2 - z1) / 0.5, x0 - eps, atol=1e-5)
+
+
+def test_flow_paper_velocity_identity():
+    """The paper's v = (x - z_t) / (1 - t) equals x - eps."""
+    fm = FlowMatching()
+    x0 = torch.randn(2, 3, 4, 4)
+    eps = torch.randn_like(x0)
+    t = 0.6
+    z = fm.q_sample(x0, t, noise=eps)
+    assert torch.allclose((x0 - z) / (1 - t), x0 - eps, atol=1e-5)
+
+
+def test_flow_q_sample_preserves_dtype_and_shape():
+    fm = FlowMatching()
+    x0 = torch.randn(2, 3, 8, 8, dtype=torch.float64)
+    z = fm.q_sample(x0, torch.rand(2))
+    assert z.shape == x0.shape and z.dtype == torch.float64
+
+
+def test_flow_q_sample_rejects_mismatched_batch():
+    fm = FlowMatching()
+    with pytest.raises(ValueError):
+        fm.q_sample(torch.randn(4, 3, 8, 8), torch.rand(3))
+
+
+def test_flow_q_sample_rejects_mismatched_noise():
+    fm = FlowMatching()
+    with pytest.raises(ValueError):
+        fm.q_sample(torch.randn(4, 3, 8, 8), torch.rand(4),
+                    noise=torch.randn(4, 3, 4, 4))
+
+
+def test_flow_rejects_nonpositive_noise_scale():
+    with pytest.raises(ValueError):
+        FlowMatching(noise_scale=0.0)
+
+
+def test_flow_q_sample_feeds_the_model_directly():
+    """z_t is the network input, unscaled -- no preconditioning."""
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    x0 = torch.randn(2, 3, 32, 32)
+    z = fm.q_sample(x0, torch.rand(2))
+    with torch.no_grad():
+        out = model(z, torch.rand(2), torch.randint(0, 10, (2,)))
+    assert out.shape == x0.shape
+
+
+# -- flow matching: x-prediction with v-loss ------------------------------
+
+
+def test_logit_normal_t_is_in_range_and_centred():
+    fm = FlowMatching(t_mu=-0.8, t_sigma=0.8)
+    t = fm.sample_t(50000)
+    assert t.shape == (50000,)
+    assert (t > 0).all() and (t < 1).all()
+    # logit(t) should recover the prior.
+    s = torch.log(t / (1 - t))
+    assert abs(s.mean().item() - (-0.8)) < 0.02
+    assert abs(s.std().item() - 0.8) < 0.02
+
+
+def test_more_negative_t_mu_means_more_noise():
+    """Smaller t = less signal in z_t = t*x + (1-t)*eps."""
+    low = FlowMatching(t_mu=-1.2).sample_t(50000).mean().item()
+    high = FlowMatching(t_mu=-0.0).sample_t(50000).mean().item()
+    assert low < high
+
+
+def test_to_velocity_equals_x_minus_eps():
+    fm = FlowMatching(denom_clip=1e-8)
+    x0 = torch.randn(4, 3, 8, 8)
+    eps = torch.randn_like(x0)
+    t = torch.rand(4) * 0.9  # stay away from the clip
+    z = fm.q_sample(x0, t, noise=eps)
+    assert torch.allclose(fm.to_velocity(x0, z, t), x0 - eps, atol=1e-4)
+
+
+def test_from_velocity_inverts_to_velocity():
+    fm = FlowMatching()
+    x0 = torch.randn(4, 3, 8, 8)
+    t = torch.rand(4) * 0.9
+    z = fm.q_sample(x0, t)
+    v = fm.to_velocity(x0, z, t)
+    assert torch.allclose(fm.from_velocity(v, z, t), x0, atol=1e-5)
+
+
+def test_denominator_is_clipped_at_t_near_one():
+    """Without clipping, v blows up as t -> 1."""
+    fm = FlowMatching(denom_clip=0.05)
+    x0 = torch.randn(2, 3, 4, 4)
+    t = torch.full((2,), 1.0)
+    z = fm.q_sample(x0, t)  # z == x0 exactly
+    v = fm.to_velocity(x0, z, t)
+    assert torch.isfinite(v).all()
+    assert (v == 0).all()  # numerator is zero, denominator is 0.05 not 0
+
+    off = fm.to_velocity(x0 + 1.0, z, t)
+    assert torch.allclose(off, torch.full_like(off, 1 / 0.05), atol=1e-4)
+
+
+def test_v_loss_is_zero_for_a_perfect_x_predictor():
+    fm = FlowMatching()
+    x0 = torch.randn(4, 3, 8, 8)
+    oracle = lambda z, t, **kw: x0
+    terms = fm.training_losses(oracle, x0)
+    assert terms["loss"].abs().max() < 1e-10
+    assert terms["x_mse"].abs().max() < 1e-10
+
+
+def test_v_loss_equals_x_loss_weighted_by_inverse_one_minus_t_squared():
+    """Footnote 4 of the paper: v-loss == x-loss with weight 1/(1-t)^2."""
+    fm = FlowMatching()
+    x0 = torch.randn(4, 3, 8, 8)
+    t = torch.rand(4) * 0.9
+    noise = torch.randn_like(x0)
+    bias = torch.randn_like(x0)
+    imperfect = lambda z, t_, **kw: x0 + bias
+
+    terms = fm.training_losses(imperfect, x0, t=t, noise=noise)
+    w = (1 - t).clamp(min=fm.denom_clip).pow(-2)
+    x_loss = bias.pow(2).flatten(1).mean(1)
+    assert torch.allclose(terms["loss"], w * x_loss, atol=1e-5)
+
+
+def test_training_losses_samples_t_when_omitted():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False)
+    terms = fm.training_losses(
+        model, torch.randn(4, 3, 32, 32),
+        model_kwargs={"y": torch.randint(0, 10, (4,))},
+    )
+    assert terms["loss"].shape == (4,)
+    assert torch.isfinite(terms["loss"]).all()
+    assert (terms["loss"] >= 0).all()
+
+
+def test_training_losses_rejects_a_learn_sigma_model():
+    """x-prediction has no variance head; a 2C output is a configuration error."""
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=True)
+    with pytest.raises(ValueError, match="learn_sigma=False"):
+        fm.training_losses(
+            model, torch.randn(2, 3, 32, 32),
+            model_kwargs={"y": torch.randint(0, 10, (2,))},
+        )
+
+
+def test_model_receives_rescaled_time():
+    """t in [0,1] must be scaled to the embedder's [0,1000) range."""
+    fm = FlowMatching(time_scale=1000.0)
+    seen = {}
+
+    def spy(z, t, **kw):
+        seen["t"] = t
+        return torch.zeros_like(z)
+
+    t = torch.tensor([0.0, 0.25, 1.0])
+    fm.training_losses(spy, torch.randn(3, 3, 8, 8), t=t)
+    assert torch.allclose(seen["t"], torch.tensor([0.0, 250.0, 1000.0]), atol=1e-4)
+    assert seen["t"].shape == (3,)
+
+
+def test_gradients_reach_the_model_through_v_loss():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False, bottleneck_dim=8)
+    torch.nn.init.normal_(model.final_layer.linear.weight, std=0.02)
+    terms = fm.training_losses(
+        model, torch.randn(2, 3, 32, 32),
+        model_kwargs={"y": torch.randint(0, 10, (2,))},
+    )
+    terms["loss"].mean().backward()
+    for name in ("proj", "expand"):
+        for p in getattr(model.x_embedder, name).parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), name
+    assert torch.isfinite(model.final_layer.linear.weight.grad).all()
+
+
+def test_x_mse_is_detached():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False)
+    terms = fm.training_losses(
+        model, torch.randn(2, 3, 32, 32),
+        model_kwargs={"y": torch.randint(0, 10, (2,))},
+    )
+    assert not terms["x_mse"].requires_grad
+
+
+def test_supplied_t_and_noise_make_the_loss_deterministic():
+    fm = FlowMatching()
+    model = tiny_model(learn_sigma=False).eval()
+    x0 = torch.randn(2, 3, 32, 32)
+    kw = dict(t=torch.rand(2), noise=torch.randn_like(x0),
+              model_kwargs={"y": torch.zeros(2, dtype=torch.long)})
+    with torch.no_grad():
+        a = fm.training_losses(model, x0, **kw)["loss"]
+        b = fm.training_losses(model, x0, **kw)["loss"]
+    assert torch.allclose(a, b, atol=1e-7)
 
 
 def test_reverse_process_recovers_data_with_an_oracle_model():
