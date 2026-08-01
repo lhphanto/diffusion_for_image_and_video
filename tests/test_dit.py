@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from dit.diffusion import FlowMatching, GaussianDiffusion
+from dit.diffusion import FlowMatching
 from dit.model import DIT_MODELS, DiT, DiT_B, get_2d_sincos_pos_embed
 
 
@@ -230,12 +230,11 @@ def test_bottleneck_reduces_patch_embedding_parameters():
 
 
 def test_bottleneck_model_trains_end_to_end():
-    model = tiny_model(bottleneck_dim=8)
-    d = GaussianDiffusion(num_timesteps=100, learn_sigma=True)
+    model = tiny_model(bottleneck_dim=8, learn_sigma=False)
+    fm = FlowMatching()
     x = torch.randn(2, 3, 32, 32)
-    t = torch.randint(0, 100, (2,))
     y = torch.randint(0, 10, (2,))
-    d.training_losses(model, x, t, model_kwargs={"y": y})["loss"].mean().backward()
+    fm.training_losses(model, x, model_kwargs={"y": y})["loss"].mean().backward()
     for name in ("proj", "expand"):
         for p in getattr(model.x_embedder, name).parameters():
             assert p.grad is not None and torch.isfinite(p.grad).all(), name
@@ -273,197 +272,6 @@ def test_gradients_flow_to_every_block():
     for i, block in enumerate(model.blocks):
         g = block.adaLN_modulation[-1].weight.grad
         assert g is not None and torch.isfinite(g).all(), i
-
-
-# -- diffusion -----------------------------------------------------------
-
-
-@pytest.mark.parametrize("schedule", ["cosine", "linear"])
-def test_schedule_is_valid(schedule):
-    d = GaussianDiffusion(num_timesteps=100, beta_schedule=schedule)
-    assert (d.betas > 0).all() and (d.betas < 1).all()
-    # alphas_cumprod decreases monotonically from near 1 towards 0.
-    assert (d.alphas_cumprod[1:] < d.alphas_cumprod[:-1]).all()
-    assert d.alphas_cumprod[0] < 1.0
-    assert d.alphas_cumprod[-1] < 0.05
-
-
-def test_q_sample_matches_closed_form_statistics():
-    d = GaussianDiffusion(num_timesteps=1000)
-    x0 = torch.ones(4096, 1, 4, 4)
-    t = torch.full((4096,), 500, dtype=torch.long)
-    xt = d.q_sample(x0, t)
-    a = d.sqrt_alphas_cumprod[500].item()
-    s = d.sqrt_one_minus_alphas_cumprod[500].item()
-    assert abs(xt.mean().item() - a) < 0.02
-    assert abs(xt.std().item() - s) < 0.02
-
-
-def test_q_sample_at_t0_is_nearly_clean():
-    d = GaussianDiffusion(num_timesteps=1000)
-    x0 = torch.randn(8, 3, 8, 8)
-    t = torch.zeros(8, dtype=torch.long)
-    xt = d.q_sample(x0, t, noise=torch.randn_like(x0))
-    assert (xt - x0).abs().mean() < 0.05
-
-
-def test_predict_xstart_from_eps_is_exact_inverse_of_q_sample():
-    d = GaussianDiffusion(num_timesteps=1000)
-    x0 = torch.randn(8, 3, 8, 8)
-    eps = torch.randn_like(x0)
-    t = torch.randint(0, 1000, (8,))
-    xt = d.q_sample(x0, t, noise=eps)
-    assert torch.allclose(d.predict_xstart_from_eps(xt, t, eps), x0, atol=1e-3)
-    assert torch.allclose(d.predict_eps_from_xstart(xt, t, x0), eps, atol=1e-3)
-
-
-def test_posterior_mean_is_x0_at_t0():
-    d = GaussianDiffusion(num_timesteps=1000)
-    x0 = torch.randn(4, 3, 8, 8)
-    t = torch.zeros(4, dtype=torch.long)
-    xt = d.q_sample(x0, t)
-    mean, var, _ = d.q_posterior_mean_variance(x0, xt, t)
-    assert torch.allclose(mean, x0, atol=1e-3)
-    assert var.max() < 1e-4
-
-
-def test_learned_variance_stays_between_posterior_and_beta():
-    d = GaussianDiffusion(num_timesteps=1000, learn_sigma=True)
-    x = torch.randn(4, 3, 8, 8)
-    t = torch.full((4,), 500, dtype=torch.long)
-    for v, expected in [(-1.0, d.posterior_log_variance_clipped[500]),
-                        (1.0, torch.log(d.betas[500]))]:
-        out = torch.cat([torch.zeros_like(x), torch.full_like(x, v)], dim=1)
-        _, log_var = d._split_model_output(out, x, t)
-        assert torch.allclose(log_var, expected.expand_as(log_var), atol=1e-5)
-
-
-def test_training_losses_shapes_and_finiteness():
-    model = tiny_model(learn_sigma=True)
-    d = GaussianDiffusion(num_timesteps=1000, learn_sigma=True)
-    x = torch.randn(4, 3, 32, 32)
-    t = torch.randint(0, 1000, (4,))
-    y = torch.randint(0, 10, (4,))
-    terms = d.training_losses(model, x, t, model_kwargs={"y": y})
-    for key in ("loss", "mse", "vb"):
-        assert terms[key].shape == (4,)
-        assert torch.isfinite(terms[key]).all(), key
-    assert (terms["loss"] >= 0).all()
-
-
-def test_vb_term_does_not_train_the_epsilon_head():
-    """The VLB gradient must reach the variance channels only."""
-    model = tiny_model(learn_sigma=True)
-    torch.nn.init.normal_(model.final_layer.linear.weight, std=0.02)
-    d = GaussianDiffusion(num_timesteps=1000, learn_sigma=True)
-    x = torch.randn(4, 3, 32, 32)
-    t = torch.randint(1, 1000, (4,))
-    y = torch.randint(0, 10, (4,))
-
-    terms = d.training_losses(model, x, t, model_kwargs={"y": y})
-    terms["vb"].mean().backward()
-    grad = model.final_layer.linear.weight.grad
-    # Output rows are ordered patch-major: (p*p, out_channels) flattened.
-    per_pixel = grad.view(16, 16, 6, -1)
-    eps_grad = per_pixel[:, :, :3].abs().sum()
-    var_grad = per_pixel[:, :, 3:].abs().sum()
-    assert eps_grad.item() == 0.0
-    assert var_grad.item() > 0.0
-
-
-def test_mse_term_equals_zero_for_a_perfect_model():
-    d = GaussianDiffusion(num_timesteps=1000, learn_sigma=False)
-    x0 = torch.randn(4, 3, 8, 8)
-    noise = torch.randn_like(x0)
-    t = torch.randint(0, 1000, (4,))
-    oracle = lambda x_t, t_, **kw: noise
-    terms = d.training_losses(oracle, x0, t, noise=noise)
-    assert terms["mse"].abs().max() < 1e-12
-
-
-def test_training_losses_without_learn_sigma_has_zero_vb():
-    model = tiny_model(learn_sigma=False)
-    d = GaussianDiffusion(num_timesteps=1000, learn_sigma=False)
-    terms = d.training_losses(
-        model, torch.randn(2, 3, 32, 32), torch.randint(0, 1000, (2,)),
-        model_kwargs={"y": torch.randint(0, 10, (2,))},
-    )
-    assert (terms["vb"] == 0).all()
-    assert torch.allclose(terms["loss"], terms["mse"])
-
-
-def test_normal_kl_is_zero_for_identical_gaussians():
-    from dit.diffusion import normal_kl
-
-    mean, logvar = torch.randn(10), torch.randn(10)
-    assert torch.allclose(normal_kl(mean, logvar, mean, logvar),
-                          torch.zeros(10), atol=1e-6)
-
-
-def test_normal_kl_matches_analytic_value():
-    from dit.diffusion import normal_kl
-
-    # KL(N(0,1) || N(1,1)) = 0.5
-    kl = normal_kl(torch.zeros(1), torch.zeros(1), torch.ones(1), torch.zeros(1))
-    assert abs(kl.item() - 0.5) < 1e-6
-
-
-def test_discretized_log_likelihood_is_a_log_probability():
-    from dit.diffusion import discretized_gaussian_log_likelihood
-
-    x = torch.linspace(-1, 1, 100).view(-1, 1)
-    ll = discretized_gaussian_log_likelihood(
-        x, means=torch.zeros_like(x), log_scales=torch.full_like(x, math.log(0.1))
-    )
-    assert (ll <= 1e-6).all()
-    assert torch.isfinite(ll).all()
-
-
-@pytest.mark.parametrize("sampler", ["ddpm", "ddim"])
-def test_sampling_loops_produce_finite_images(sampler):
-    model = tiny_model(learn_sigma=True).eval()
-    d = GaussianDiffusion(num_timesteps=50, learn_sigma=True)
-    y = torch.randint(0, 10, (2,))
-    shape = (2, 3, 32, 32)
-    if sampler == "ddpm":
-        out = d.p_sample_loop(model, shape, torch.device("cpu"), y=y)
-    else:
-        out = d.ddim_sample_loop(model, shape, torch.device("cpu"), y=y, num_steps=10)
-    assert out.shape == shape
-    assert torch.isfinite(out).all()
-
-
-def test_sampling_with_cfg_runs():
-    model = tiny_model(learn_sigma=True).eval()
-    d = GaussianDiffusion(num_timesteps=50, learn_sigma=True)
-    out = d.ddim_sample_loop(
-        model, (2, 3, 32, 32), torch.device("cpu"),
-        y=torch.randint(0, 10, (2,)), cfg_scale=4.0, num_steps=5,
-    )
-    assert out.shape == (2, 3, 32, 32)
-    assert torch.isfinite(out).all()
-
-
-def test_ddim_is_deterministic_at_eta_zero():
-    model = tiny_model(learn_sigma=True).eval()
-    d = GaussianDiffusion(num_timesteps=100, learn_sigma=True)
-    noise = torch.randn(2, 3, 32, 32)
-    y = torch.zeros(2, dtype=torch.long)
-    kw = dict(y=y, num_steps=10, eta=0.0, noise=noise)
-    a = d.ddim_sample_loop(model, (2, 3, 32, 32), torch.device("cpu"), **kw)
-    b = d.ddim_sample_loop(model, (2, 3, 32, 32), torch.device("cpu"), **kw)
-    assert torch.allclose(a, b, atol=1e-6)
-
-
-def test_ddim_step_count_is_validated():
-    d = GaussianDiffusion(num_timesteps=10)
-    with pytest.raises(ValueError):
-        d.ddim_sample_loop(tiny_model().eval(), (1, 3, 32, 32),
-                           torch.device("cpu"), y=torch.zeros(1, dtype=torch.long),
-                           num_steps=50)
-
-
-# -- flow matching: linear interpolant -----------------------------------
 
 
 def test_flow_q_sample_endpoints():
@@ -1060,18 +868,3 @@ def test_sample_reconstructs_the_training_noise_scale(tmp_path):
     assert flow.noise_scale == 2.0
     assert flow.t_mu == -0.8 and flow.denom_clip == 0.05
 
-
-def test_reverse_process_recovers_data_with_an_oracle_model():
-    """An oracle that knows the true noise should reconstruct x0 via DDIM."""
-    torch.manual_seed(0)
-    d = GaussianDiffusion(num_timesteps=1000, learn_sigma=False)
-    x0 = torch.randn(2, 3, 8, 8).clamp(-1, 1)
-
-    def oracle(x_t, t, **kwargs):
-        # Invert q_sample analytically for the known x0.
-        return d.predict_eps_from_xstart(x_t, t, x0)
-
-    out = d.ddim_sample_loop(
-        oracle, x0.shape, torch.device("cpu"), num_steps=100, clip_denoised=False
-    )
-    assert (out - x0).abs().mean() < 0.05

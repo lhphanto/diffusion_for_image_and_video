@@ -1,0 +1,7 @@
+torch>=2.4
+torchvision>=0.19
+numpy>=1.24
+datasets>=2.19
+pillow>=10.0
+tqdm>=4.65
+pytest>=8.0
