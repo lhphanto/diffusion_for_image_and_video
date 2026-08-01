@@ -21,7 +21,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from .data import build_dataset, collate
-from .diffusion import GaussianDiffusion
+from .diffusion import FlowMatching
 from .model import DIT_MODELS
 
 logger = logging.getLogger("dit")
@@ -139,7 +139,9 @@ def main(args):
         in_channels=3,
         num_classes=num_classes,
         class_dropout_prob=args.class_dropout_prob,
-        learn_sigma=not args.no_learn_sigma,
+        # x-prediction: the network outputs a clean-image estimate and there
+        # is no reverse-process variance to learn.
+        learn_sigma=False,
         bottleneck_dim=args.bottleneck_dim if args.bottleneck_dim > 0 else None,
     ).to(device)
 
@@ -151,10 +153,20 @@ def main(args):
     logger.info("%s: %.1fM parameters, %d tokens", args.model, n_params / 1e6,
                 model.x_embedder.num_patches)
 
-    diffusion = GaussianDiffusion(
-        num_timesteps=args.num_timesteps,
-        beta_schedule=args.beta_schedule,
-        learn_sigma=not args.no_learn_sigma,
+    # The paper holds SNR fixed across resolutions by scaling the noise
+    # endpoint proportionally: 1.0 at 256, 2.0 at 512, 4.0 at 1024.
+    noise_scale = (
+        args.noise_scale if args.noise_scale > 0 else args.image_size / 256.0
+    )
+    flow = FlowMatching(
+        noise_scale=noise_scale,
+        t_mu=args.t_mu,
+        t_sigma=args.t_sigma,
+        denom_clip=args.denom_clip,
+    )
+    logger.info(
+        "flow matching: noise_scale %.2f, logit-normal t (mu %.2f, sigma %.2f)",
+        noise_scale, args.t_mu, args.t_sigma,
     )
 
     ddp_model = model
@@ -186,7 +198,7 @@ def main(args):
     # -- loop --------------------------------------------------------------
     model.train()
     step = start_step
-    running_loss, running_n, t0 = 0.0, 0, time.time()
+    running_loss, running_x_mse, running_n, t0 = 0.0, 0.0, 0, time.time()
 
     for epoch in range(args.epochs):
         if sampler is not None:
@@ -198,12 +210,15 @@ def main(args):
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+
+            # Linear warmup on the raw lr, applied before the step it governs.
+            if args.warmup_steps > 0 and step < args.warmup_steps:
+                for g in opt.param_groups:
+                    g["lr"] = args.lr * (step + 1) / args.warmup_steps
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                terms = diffusion.training_losses(
-                    ddp_model, x, t, model_kwargs={"y": y}
-                )
+                # t is drawn from the logit-normal prior inside training_losses.
+                terms = flow.training_losses(ddp_model, x, model_kwargs={"y": y})
                 loss = terms["loss"].mean()
 
             opt.zero_grad(set_to_none=True)
@@ -214,30 +229,28 @@ def main(args):
             scaler.step(opt)
             scaler.update()
 
-            # Linear warmup on the raw lr.
-            if args.warmup_steps > 0 and step < args.warmup_steps:
-                for g in opt.param_groups:
-                    g["lr"] = args.lr * (step + 1) / args.warmup_steps
-
             update_ema(ema, model, decay=args.ema_decay)
 
             running_loss += loss.item()
+            running_x_mse += terms["x_mse"].mean().item()
             running_n += 1
             step += 1
 
             if step % args.log_every == 0:
-                avg = running_loss / max(running_n, 1)
+                stats = torch.tensor(
+                    [running_loss, running_x_mse], device=device
+                ) / max(running_n, 1)
                 if world_size > 1:
-                    tensor = torch.tensor(avg, device=device)
-                    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-                    avg = (tensor / world_size).item()
+                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                    stats = stats / world_size
                 imgs_per_sec = (
                     args.log_every * args.global_batch_size / (time.time() - t0)
                 )
                 logger.info(
-                    "step %d | loss %.4f | %.1f img/s", step, avg, imgs_per_sec
+                    "step %d | v-loss %.4f | x-mse %.4f | %.1f img/s",
+                    step, stats[0].item(), stats[1].item(), imgs_per_sec,
                 )
-                running_loss, running_n, t0 = 0.0, 0, time.time()
+                running_loss, running_x_mse, running_n, t0 = 0.0, 0.0, 0, time.time()
 
             if step % args.ckpt_every == 0 and is_main(rank):
                 path = results_dir / f"ckpt_{step:08d}.pt"
@@ -295,15 +308,19 @@ def build_parser():
     # model
     p.add_argument("--model", default="DiT-B/16", choices=list(DIT_MODELS))
     p.add_argument("--class-dropout-prob", type=float, default=0.1)
-    p.add_argument("--no-learn-sigma", action="store_true")
     p.add_argument("--bottleneck-dim", type=int, default=128,
                    help="low-rank patch-embedding dim; 0 disables the bottleneck")
-    # diffusion
-    p.add_argument("--num-timesteps", type=int, default=1000)
-    p.add_argument("--beta-schedule", default="cosine", choices=["cosine", "linear"])
+    # flow matching
+    p.add_argument("--noise-scale", type=float, default=0.0,
+                   help="noise endpoint std; 0 means auto (image_size / 256)")
+    p.add_argument("--t-mu", type=float, default=-0.8,
+                   help="mean of the logit-normal t sampler; lower = noisier")
+    p.add_argument("--t-sigma", type=float, default=0.8)
+    p.add_argument("--denom-clip", type=float, default=0.05,
+                   help="lower bound on (1 - t) when converting to v-space")
     # optim
     p.add_argument("--global-batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--grad-clip", type=float, default=0.0)

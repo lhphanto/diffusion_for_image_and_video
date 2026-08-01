@@ -965,6 +965,102 @@ def test_single_step_sampling_returns_the_x_prediction():
     assert torch.allclose(out, target, atol=1e-5)
 
 
+# -- train / sample wiring ------------------------------------------------
+
+
+def test_train_and_sample_use_flow_matching_only():
+    import dit.sample as sample_mod
+    import dit.train as train_mod
+
+    src = (
+        __import__("pathlib").Path(train_mod.__file__).read_text()
+        + __import__("pathlib").Path(sample_mod.__file__).read_text()
+    )
+    assert "GaussianDiffusion" not in src
+    assert "FlowMatching" in src
+
+
+def test_train_parser_exposes_flow_matching_options():
+    from dit.train import build_parser
+
+    args = build_parser().parse_args([])
+    assert args.t_mu == -0.8 and args.t_sigma == 0.8
+    assert args.denom_clip == 0.05
+    assert args.noise_scale == 0.0  # auto -> image_size / 256
+    assert not hasattr(args, "num_timesteps")
+    assert not hasattr(args, "no_learn_sigma")
+
+
+def test_sample_parser_defaults_to_heun():
+    from dit.sample import build_parser
+
+    args = build_parser().parse_args(["--ckpt", "x.pt"])
+    assert args.solver == "heun"
+    assert args.num_steps == 50
+
+
+def test_train_then_sample_end_to_end(tmp_path):
+    """Run the real training step and the real sampling path over a checkpoint."""
+    import dit.sample as sample_mod
+    from dit.train import build_parser as train_parser
+
+    targs = train_parser().parse_args([])
+    targs.image_size, targs.model = 32, "DiT-S/16"
+    targs.bottleneck_dim, targs.class_dropout_prob = 8, 0.1
+
+    model = DIT_MODELS[targs.model](
+        image_size=targs.image_size, in_channels=3, num_classes=10,
+        class_dropout_prob=targs.class_dropout_prob, learn_sigma=False,
+        bottleneck_dim=targs.bottleneck_dim,
+    )
+    flow = FlowMatching(noise_scale=targs.image_size / 256.0, t_mu=targs.t_mu,
+                        t_sigma=targs.t_sigma, denom_clip=targs.denom_clip)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    x = torch.randn(2, 3, 32, 32)
+    y = torch.randint(0, 10, (2,))
+    before = [p.detach().clone() for p in model.parameters()]
+    loss = flow.training_losses(model, x, model_kwargs={"y": y})["loss"].mean()
+    loss.backward()
+    opt.step()
+    assert torch.isfinite(loss)
+    assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
+
+    ckpt = tmp_path / "ckpt.pt"
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(),
+                "step": 1, "args": vars(targs), "num_classes": 10}, ckpt)
+
+    out = tmp_path / "samples.png"
+    sample_mod.main(sample_mod.build_parser().parse_args([
+        "--ckpt", str(ckpt), "--out", str(out), "--num-samples", "2",
+        "--num-steps", "3", "--solver", "heun", "--cfg-scale", "2.0",
+        "--cfg-interval", "0.1", "1.0", "--device", "cpu",
+    ]))
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_sample_reconstructs_the_training_noise_scale(tmp_path):
+    """A 512-trained checkpoint must sample with noise_scale 2.0, not 1.0."""
+    from dit.sample import load_model
+    from dit.train import build_parser as train_parser
+
+    targs = train_parser().parse_args([])
+    targs.image_size, targs.model = 512, "DiT-S/16"
+    targs.bottleneck_dim, targs.class_dropout_prob = 8, 0.1
+
+    model = DIT_MODELS[targs.model](
+        image_size=512, in_channels=3, num_classes=4, class_dropout_prob=0.1,
+        learn_sigma=False, bottleneck_dim=8,
+    )
+    ckpt = tmp_path / "c.pt"
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(),
+                "args": vars(targs), "num_classes": 4}, ckpt)
+
+    _, flow, _, _ = load_model(str(ckpt), torch.device("cpu"))
+    assert flow.noise_scale == 2.0
+    assert flow.t_mu == -0.8 and flow.denom_clip == 0.05
+
+
 def test_reverse_process_recovers_data_with_an_oracle_model():
     """An oracle that knows the true noise should reconstruct x0 via DDIM."""
     torch.manual_seed(0)
