@@ -26,12 +26,14 @@ def pick_device(name=None):
 def load_model(ckpt_path, device, use_ema=True):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     targs = ckpt["args"]
+    bottleneck = targs.get("bottleneck_dim", 128)
     model = DIT_MODELS[targs["model"]](
         image_size=targs["image_size"],
         in_channels=3,
         num_classes=ckpt.get("num_classes", 1000),
         class_dropout_prob=targs["class_dropout_prob"],
         learn_sigma=not targs["no_learn_sigma"],
+        bottleneck_dim=bottleneck if bottleneck and bottleneck > 0 else None,
     ).to(device)
     state = ckpt["ema"] if use_ema and "ema" in ckpt else ckpt["model"]
     model.load_state_dict(state)

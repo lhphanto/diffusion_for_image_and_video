@@ -161,6 +161,104 @@ def test_dit_b_16_config_matches_spec():
     assert 120e6 < n_params < 145e6, n_params
 
 
+# -- bottleneck patch embedding ------------------------------------------
+
+
+def test_bottleneck_layer_shapes():
+    """16x16x3 = 768-d raw patch -> 128 -> 768 hidden, both layers linear."""
+    model = DiT_B(16, image_size=256, num_classes=10, bottleneck_dim=128)
+    emb = model.x_embedder
+    assert emb.patch_dim == 768
+    assert emb.bottleneck_dim == 128
+    assert emb.proj.out_channels == 128
+    assert emb.proj.bias is None
+    assert emb.expand.in_features == 128
+    assert emb.expand.out_features == 768
+
+
+def test_bottleneck_is_default_for_configs():
+    assert DiT_B(16, image_size=32, num_classes=4).x_embedder.bottleneck_dim == 128
+    assert DIT_MODELS["DiT-XL/2"](image_size=32,
+                                  num_classes=4).x_embedder.bottleneck_dim == 256
+
+
+def test_bottleneck_disabled_matches_plain_embedding():
+    model = DiT_B(16, image_size=32, num_classes=4, bottleneck_dim=None)
+    assert model.x_embedder.expand is None
+    assert model.x_embedder.proj.out_channels == 768
+    assert model.x_embedder.proj.bias is not None
+
+
+def test_bottleneck_forward_shape_and_rank():
+    model = tiny_model(bottleneck_dim=8, hidden_size=64)
+    x = torch.randn(2, 3, 32, 32)
+    tokens = model.x_embedder(x)
+    assert tokens.shape == (2, 4, 64)
+
+    # The composed map really is rank <= bottleneck_dim. Count singular values
+    # with an explicit relative threshold: the weights are float32, so the
+    # numerical noise floor sits well above matrix_rank's float64 default tol.
+    w1 = model.x_embedder.proj.weight.reshape(8, -1)  # (8, 768)
+    w2 = model.x_embedder.expand.weight  # (64, 8)
+    composed = w2 @ w1  # (64, 768)
+    assert composed.shape == (64, 768)
+    sv = torch.linalg.svdvals(composed.double())
+    assert int((sv > sv[0] * 1e-4).sum()) == 8
+
+
+def test_bottleneck_has_no_nonlinearity_between_layers():
+    """A low-rank linear map must be exactly additive over its input."""
+    model = tiny_model(bottleneck_dim=8, hidden_size=64)
+    emb = model.x_embedder
+    a, b = torch.randn(1, 3, 32, 32), torch.randn(1, 3, 32, 32)
+    with torch.no_grad():
+        # Subtract the bias to isolate the linear part.
+        bias = emb(torch.zeros_like(a))
+        lhs = emb(a + b) - bias
+        rhs = (emb(a) - bias) + (emb(b) - bias)
+    assert torch.allclose(lhs, rhs, atol=1e-5)
+
+
+def test_bottleneck_reduces_patch_embedding_parameters():
+    with_bn = DiT_B(16, image_size=256, num_classes=10, bottleneck_dim=128)
+    without = DiT_B(16, image_size=256, num_classes=10, bottleneck_dim=None)
+    n = lambda m: sum(p.numel() for p in m.x_embedder.parameters())
+    # 768*128 + 128*768 + 768 vs 768*768 + 768
+    assert n(with_bn) == 768 * 128 + 128 * 768 + 768
+    assert n(without) == 768 * 768 + 768
+    assert n(with_bn) < n(without)
+
+
+def test_bottleneck_model_trains_end_to_end():
+    model = tiny_model(bottleneck_dim=8)
+    d = GaussianDiffusion(num_timesteps=100, learn_sigma=True)
+    x = torch.randn(2, 3, 32, 32)
+    t = torch.randint(0, 100, (2,))
+    y = torch.randint(0, 10, (2,))
+    d.training_losses(model, x, t, model_kwargs={"y": y})["loss"].mean().backward()
+    for name in ("proj", "expand"):
+        for p in getattr(model.x_embedder, name).parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), name
+
+
+def test_bottleneck_survives_state_dict_roundtrip():
+    a = tiny_model(bottleneck_dim=8).eval()
+    b = tiny_model(bottleneck_dim=8).eval()
+    b.load_state_dict(a.state_dict())
+    x, t = torch.randn(2, 3, 32, 32), torch.randint(0, 1000, (2,))
+    y = torch.randint(0, 10, (2,))
+    with torch.no_grad():
+        assert torch.allclose(a(x, t, y), b(x, t, y), atol=1e-6)
+
+
+def test_high_resolution_patch_dim_exceeds_hidden_size():
+    """The point of the bottleneck: patch dim can dwarf the transformer width."""
+    model = DiT_B(32, image_size=512, num_classes=10, bottleneck_dim=128)
+    assert model.x_embedder.patch_dim == 3072  # 32*32*3
+    assert model.x_embedder.num_patches == 256  # same sequence length as /16 @ 256
+    assert model.x_embedder.expand.out_features == 768
+
+
 def test_all_registered_configs_build():
     for name, ctor in DIT_MODELS.items():
         model = ctor(image_size=32, num_classes=4)

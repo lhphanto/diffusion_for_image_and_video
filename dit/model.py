@@ -26,9 +26,33 @@ def modulate(x, shift, scale):
 
 
 class PatchEmbed(nn.Module):
-    """Split an image into non-overlapping patches and linearly project them."""
+    """Split an image into non-overlapping patches and linearly project them.
 
-    def __init__(self, image_size=256, patch_size=16, in_channels=3, hidden_size=768):
+    With ``bottleneck_dim`` set, the single patch-embedding linear layer is
+    replaced by a pair of sequential linear layers with no nonlinearity
+    between them:
+
+        raw patch (patch_size**2 * C)  ->  bottleneck_dim  ->  hidden_size
+
+    This is a low-rank reparameterisation of the embedding. It decouples the
+    raw patch dimension from the transformer width, which matters because the
+    patch dimension grows with resolution (768-d at 16x16x3, 3072-d at
+    32x32x3), and empirically a bottleneck in the 32-512 range improves
+    sample quality rather than hurting it. See "Back to Basics: Let Denoising
+    Generative Models Denoise" (arXiv:2511.13720), Fig. 4 and Tab. 9.
+
+    The first projection is implemented as a strided conv, which is exactly a
+    linear map applied to each flattened patch.
+    """
+
+    def __init__(
+        self,
+        image_size=256,
+        patch_size=16,
+        in_channels=3,
+        hidden_size=768,
+        bottleneck_dim=None,
+    ):
         super().__init__()
         if image_size % patch_size != 0:
             raise ValueError(
@@ -38,8 +62,21 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.grid_size = image_size // patch_size
         self.num_patches = self.grid_size**2
+        self.patch_dim = patch_size * patch_size * in_channels
+        self.bottleneck_dim = bottleneck_dim
+
+        proj_dim = bottleneck_dim if bottleneck_dim else hidden_size
+        # No bias on the first layer: with two stacked linear maps a single
+        # bias on the second is enough to span the same function class.
         self.proj = nn.Conv2d(
-            in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
+            in_channels,
+            proj_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=bottleneck_dim is None,
+        )
+        self.expand = (
+            nn.Linear(bottleneck_dim, hidden_size, bias=True) if bottleneck_dim else None
         )
 
     def forward(self, x):
@@ -49,8 +86,11 @@ class PatchEmbed(nn.Module):
                 f"input is {h}x{w}, but model was built for "
                 f"{self.image_size}x{self.image_size}"
             )
-        x = self.proj(x)  # (N, D, H/P, W/P)
-        return x.flatten(2).transpose(1, 2)  # (N, T, D)
+        x = self.proj(x)  # (N, D', H/P, W/P)
+        x = x.flatten(2).transpose(1, 2)  # (N, T, D')
+        if self.expand is not None:
+            x = self.expand(x)  # (N, T, D)
+        return x
 
 
 class TimestepEmbedder(nn.Module):
@@ -253,6 +293,9 @@ class DiT(nn.Module):
             which enables classifier-free guidance at sampling time.
         learn_sigma: if True the model outputs 2*in_channels channels, the
             second half parameterising the reverse-process variance.
+        bottleneck_dim: intermediate dimension of the low-rank patch
+            embedding (see :class:`PatchEmbed`). None disables it, giving the
+            original single-linear DiT embedding.
     """
 
     def __init__(
@@ -267,6 +310,7 @@ class DiT(nn.Module):
         num_classes=1000,
         class_dropout_prob=0.1,
         learn_sigma=True,
+        bottleneck_dim=None,
     ):
         super().__init__()
         self.image_size = image_size
@@ -276,8 +320,11 @@ class DiT(nn.Module):
         self.learn_sigma = learn_sigma
         self.num_classes = num_classes
         self.num_heads = num_heads
+        self.bottleneck_dim = bottleneck_dim
 
-        self.x_embedder = PatchEmbed(image_size, patch_size, in_channels, hidden_size)
+        self.x_embedder = PatchEmbed(
+            image_size, patch_size, in_channels, hidden_size, bottleneck_dim
+        )
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = (
             LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
@@ -311,10 +358,12 @@ class DiT(nn.Module):
         )
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        # Patch embedding: initialise like nn.Linear.
+        # Patch embedding: initialise the (possibly low-rank) projection like
+        # nn.Linear. _basic_init already handled self.x_embedder.expand.
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        if self.x_embedder.proj.bias is not None:
+            nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         if self.y_embedder is not None:
             nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
@@ -388,21 +437,30 @@ class DiT(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-def DiT_B(patch_size=16, **kwargs):
+# Default bottleneck dimensions follow arXiv:2511.13720 Tab. 9 (128 for the
+# B/L sizes, 256 for the largest). Pass bottleneck_dim=None for the original
+# DiT single-linear patch embedding.
+
+
+def DiT_B(patch_size=16, bottleneck_dim=128, **kwargs):
     """DiT-B: depth 12, hidden size 768, 12 heads (~130M params at /16)."""
-    return DiT(patch_size=patch_size, depth=12, hidden_size=768, num_heads=12, **kwargs)
+    return DiT(patch_size=patch_size, depth=12, hidden_size=768, num_heads=12,
+               bottleneck_dim=bottleneck_dim, **kwargs)
 
 
-def DiT_S(patch_size=16, **kwargs):
-    return DiT(patch_size=patch_size, depth=12, hidden_size=384, num_heads=6, **kwargs)
+def DiT_S(patch_size=16, bottleneck_dim=128, **kwargs):
+    return DiT(patch_size=patch_size, depth=12, hidden_size=384, num_heads=6,
+               bottleneck_dim=bottleneck_dim, **kwargs)
 
 
-def DiT_L(patch_size=16, **kwargs):
-    return DiT(patch_size=patch_size, depth=24, hidden_size=1024, num_heads=16, **kwargs)
+def DiT_L(patch_size=16, bottleneck_dim=128, **kwargs):
+    return DiT(patch_size=patch_size, depth=24, hidden_size=1024, num_heads=16,
+               bottleneck_dim=bottleneck_dim, **kwargs)
 
 
-def DiT_XL(patch_size=16, **kwargs):
-    return DiT(patch_size=patch_size, depth=28, hidden_size=1152, num_heads=16, **kwargs)
+def DiT_XL(patch_size=16, bottleneck_dim=256, **kwargs):
+    return DiT(patch_size=patch_size, depth=28, hidden_size=1152, num_heads=16,
+               bottleneck_dim=bottleneck_dim, **kwargs)
 
 
 DIT_MODELS = {

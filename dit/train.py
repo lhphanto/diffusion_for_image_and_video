@@ -140,6 +140,7 @@ def main(args):
         num_classes=num_classes,
         class_dropout_prob=args.class_dropout_prob,
         learn_sigma=not args.no_learn_sigma,
+        bottleneck_dim=args.bottleneck_dim if args.bottleneck_dim > 0 else None,
     ).to(device)
 
     ema = copy.deepcopy(model).to(device)
@@ -295,6 +296,8 @@ def build_parser():
     p.add_argument("--model", default="DiT-B/16", choices=list(DIT_MODELS))
     p.add_argument("--class-dropout-prob", type=float, default=0.1)
     p.add_argument("--no-learn-sigma", action="store_true")
+    p.add_argument("--bottleneck-dim", type=int, default=128,
+                   help="low-rank patch-embedding dim; 0 disables the bottleneck")
     # diffusion
     p.add_argument("--num-timesteps", type=int, default=1000)
     p.add_argument("--beta-schedule", default="cosine", choices=["cosine", "linear"])
