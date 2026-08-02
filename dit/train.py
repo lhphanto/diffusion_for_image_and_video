@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from .data import build_dataset, collate
 from .diffusion import FlowMatching
 from .model import DIT_MODELS
+from .plotting import save_loss_curve, write_history_csv
 
 logger = logging.getLogger("dit")
 
@@ -183,12 +184,15 @@ def main(args):
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     start_step = 0
+    history = []  # (step, v_loss, x_mse) at each logging interval
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         ema.load_state_dict(ckpt["ema"])
         opt.load_state_dict(ckpt["opt"])
         start_step = ckpt.get("step", 0)
+        # Carry the curve across the resume so the final plot covers the run.
+        history = [tuple(row) for row in ckpt.get("history", [])]
         logger.info("resumed from %s at step %d", args.resume, start_step)
 
     # EMA starts from the (possibly resumed) weights.
@@ -250,6 +254,7 @@ def main(args):
                     "step %d | v-loss %.4f | x-mse %.4f | %.1f img/s",
                     step, stats[0].item(), stats[1].item(), imgs_per_sec,
                 )
+                history.append((step, stats[0].item(), stats[1].item()))
                 running_loss, running_x_mse, running_n, t0 = 0.0, 0.0, 0, time.time()
 
             if step % args.ckpt_every == 0 and is_main(rank):
@@ -262,6 +267,7 @@ def main(args):
                         "step": step,
                         "args": vars(args),
                         "num_classes": num_classes,
+                        "history": history,
                     },
                     path,
                 )
@@ -282,10 +288,16 @@ def main(args):
                 "step": step,
                 "args": vars(args),
                 "num_classes": num_classes,
+                "history": history,
             },
             path,
         )
         logger.info("saved %s", path)
+
+        write_history_csv(history, results_dir / "loss_history.csv")
+        curve = results_dir / "loss_curve.jpg"
+        if save_loss_curve(history, curve, log_every=args.log_every):
+            logger.info("saved %s", curve)
 
     if world_size > 1:
         dist.destroy_process_group()

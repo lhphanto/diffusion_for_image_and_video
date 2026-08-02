@@ -61,6 +61,12 @@ Logs report two numbers. `v-loss` is what is optimised; because it carries a
 `1/(1-t)^2` weight it is noisy across batches. `x-mse` is the plain
 reconstruction error and is the one to watch for progress.
 
+At the end of a run the results directory also gets `loss_history.csv` and
+`loss_curve.jpg`, a two-panel plot of both curves against training step with a
+rolling-mean overlay. The history is stored in checkpoints, so `--resume`
+continues the curve rather than restarting it. matplotlib is optional: without
+it the CSV is still written and the plot is skipped.
+
 ## Sample
 
 ```bash
@@ -84,6 +90,7 @@ match how the model was trained.
 | `dit/data.py` | ImageNet loading from the HuggingFace Hub, map-style or streaming |
 | `dit/train.py` | training loop: EMA, AMP, DDP, checkpointing |
 | `dit/sample.py` | load a checkpoint and write an image grid |
+| `dit/plotting.py` | training-curve CSV and JPG |
 | `tests/test_dit.py` | 74 tests |
 
 ## Model
