@@ -81,6 +81,42 @@ euler` costs `N` and is roughly first-order accurate. `noise_scale` and the
 other process settings are read back from the checkpoint, so samples always
 match how the model was trained.
 
+## Results
+
+An early checkpoint of a `DiT-B/16` run at 256x256, sampled with:
+
+```bash
+python -m dit.sample --ckpt ckpt_final.pt --class-labels 207 360 88 \
+    --cfg-scale 2.0 --num-steps 50 --solver heun --out samples.png
+```
+
+<img src="samples.png" alt="Samples for golden retriever, otter, and macaw" width="200">
+
+Top to bottom: golden retriever (207), otter (360), macaw (88).
+
+**What works.** All three are unambiguously the requested class, so label
+embedding, adaLN-Zero conditioning, and classifier-free guidance are all doing
+their job. Local statistics are convincing: fur, individual feathers, grass,
+and background depth-of-field blur. Most importantly there is no catastrophic
+failure, which is the outcome that matters most for a *pixel-space* model at
+768-d patches -- the regime where the paper reports epsilon-prediction
+collapsing to FID 372. x-prediction plus the bottleneck embedding holds up.
+
+**What does not, yet.** Global structure. The retriever has a duplicated head
+and an incoherent limb count; the otter's anatomy is scrambled. The macaw is
+cleanest, which fits -- a rigid, high-contrast subject demands the least
+long-range coherence, while a deformable body with no strong shape prior
+demands the most.
+
+That split, correct local texture with broken global geometry, is the expected
+signature of an under-trained diffusion model rather than a defect: these
+models acquire local statistics well before long-range structure. For scale,
+the paper's ablations run 200 epochs and its headline numbers 600.
+
+These are uncurated single samples at one guidance scale, not an evaluation.
+There is no FID here, and one image per class cannot separate "the model has
+this class right" from a lucky draw.
+
 ## Layout
 
 | file | contents |
